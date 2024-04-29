@@ -1,0 +1,120 @@
+Описание задачи:
+Магазин получает товары от поставщиков. При получении формируется товарно-транспортная накладная (экспорт в MS Excel). Оплата полученных товаров может осуществляться в срок до трёх месяцев. За период для выбранных поставщиков сформировать материальный отчёт с указанием оборотов и не оплаченной суммы. За период по дням для выбранных товаров нарисовать столбиковую диаграмму, отображающую суммы, подлежащие оплате.
+
+Код БД:
+CREATE TABLE Products (
+	product_id SERIAL NOT NULL PRIMARY KEY,
+	product_name VARCHAR(300) NOT NULL,
+	product_measurement_unit VARCHAR(300) NOT NULL,
+	product_price INTEGER NOT NULL
+);
+
+CREATE TABLE Providers (
+	provider_id SERIAL NOT NULL PRIMARY KEY,
+	provider_name VARCHAR(300) NOT NULL
+);
+
+CREATE TABLE Products_invoices (
+	product_invoice_id SERIAL NOT NULL PRIMARY KEY,
+	product_id INTEGER NOT NULL,
+	provider_id INTEGER NOT NULL,
+	product_quantity INTEGER NOT NULL,
+	
+	CONSTRAINT products_invoices_products_fk FOREIGN KEY (product_id) REFERENCES Products (product_id) ON DELETE CASCADE,
+	CONSTRAINT products_invoices_providers_fk FOREIGN KEY (provider_id) REFERENCES Providers (provider_id) ON DELETE CASCADE
+);
+
+CREATE TABLE Bill_of_landing (
+	bill_of_landing_id SERIAL NOT NULL PRIMARY KEY,
+	product_invoice_id INTEGER NOT NULL,
+	total_price INTEGER NOT NULL,
+	date_of_receipt DATE,
+	payment_status VARCHAR(300) NOT NULL,
+	
+	CONSTRAINT bill_of_landing_products_invoices_fk FOREIGN KEY (product_invoice_id) REFERENCES Products_invoices (product_invoice_id) ON DELETE CASCADE
+);
+
+CREATE OR REPLACE FUNCTION create_bill_of_landing()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO Bill_of_landing (product_invoice_id, date_of_receipt, total_price, payment_status)
+    VALUES (NEW.product_invoice_id, NULL, NEW.product_quantity * (SELECT product_price FROM Products WHERE product_id = NEW.product_id), 'Не оплачено');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_create_bill_of_landing
+AFTER INSERT ON Products_invoices
+FOR EACH ROW
+EXECUTE FUNCTION create_bill_of_landing();
+
+CREATE OR REPLACE FUNCTION update_bill_of_landing()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE Bill_of_landing
+    SET total_price = NEW.product_quantity * (SELECT product_price FROM Products WHERE product_id = NEW.product_id),
+        date_of_receipt = NULL,
+        payment_status = 'Не оплачено'
+    WHERE product_invoice_id = NEW.product_invoice_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_update_bill_of_landing
+AFTER UPDATE ON Products_invoices
+FOR EACH ROW
+EXECUTE FUNCTION update_bill_of_landing();
+
+CREATE OR REPLACE FUNCTION check_payment_status()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.date_of_receipt IS NOT NULL AND NEW.payment_status != 'Оплачено' THEN
+        IF NEW.date_of_receipt + INTERVAL '3 months' < CURRENT_DATE THEN
+            NEW.payment_status := 'Просрочено';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_check_payment_status
+BEFORE UPDATE ON Bill_of_landing
+FOR EACH ROW
+EXECUTE FUNCTION check_payment_status();
+
+CREATE OR REPLACE FUNCTION delete_related_products_invoices()
+RETURNS TRIGGER AS $$
+BEGIN
+    DELETE FROM Products_invoices WHERE product_invoice_id = OLD.product_invoice_id;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_delete_related_products_invoices
+AFTER DELETE ON Bill_of_landing
+FOR EACH ROW
+EXECUTE FUNCTION delete_related_products_invoices();
+
+SELECT *
+FROM Bill_of_landing
+WHERE date_of_receipt >= :reportProvidersFrom AND date_of_receipt <= :reportProvidersTo;
+
+SELECT pi.provider_id, pr.provider_name
+FROM Products_invoices pi
+JOIN Providers pr ON pi.provider_id = pr.provider_id
+WHERE pr.provider_name IN (:providersNamesChecked);
+
+SELECT pi.provider_id, SUM(b.total_price) AS total_paid
+FROM Bill_of_landing b
+JOIN Products_invoices pi ON b.product_invoice_id = pi.product_invoice_id
+WHERE b.payment_status = 'оплачено'
+AND b.date_of_receipt >= :reportProvidersFrom AND b.date_of_receipt <= :reportProvidersTo
+GROUP BY pi.provider_id;
+
+SELECT pi.provider_id, SUM(b.total_price) AS total_unpaid
+FROM Bill_of_landing b
+JOIN Products_invoices pi ON b.product_invoice_id = pi.product_invoice_id
+WHERE b.payment_status IN ('не оплачено', 'просрочено')
+AND b.date_of_receipt >= :reportProvidersFrom AND b.date_of_receipt <= :reportProvidersTo
+GROUP BY pi.provider_id;
+
